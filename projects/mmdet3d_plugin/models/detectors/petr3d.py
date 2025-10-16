@@ -82,27 +82,40 @@ class Petr3D(MVXTwoStageDetector):
         self.test_time_print = test_time_print
 
     def extract_img_feat(
-        self, 
-        img, 
-        len_queue=1, 
+        self,
+        img,
+        len_queue=1,
         training_mode=False,
         gt_bboxes=None,
         centers2d=None,
         depths=None,
         prev_exists=None,
         ego_pose_inv=None,
+        lidar_token_prior=None,
     ):
         """Extract features of images."""
         B = img.size(0)
 
         if img is not None:
+            lidar_prior = lidar_token_prior
+            if lidar_prior is not None:
+                lidar_prior = lidar_prior.to(img.device)
+
             if img.dim() == 6:
                 img = img.flatten(1, 2)
+                if lidar_prior is not None:
+                    lidar_prior = lidar_prior.flatten(1, 2)
             if img.dim() == 5 and img.size(0) == 1:
+                if lidar_prior is not None:
+                    lidar_prior = lidar_prior.reshape(-1, lidar_prior.size(-2), lidar_prior.size(-1))
                 img.squeeze_()
             elif img.dim() == 5 and img.size(0) > 1:
                 B, N, C, H, W = img.size()
+                if lidar_prior is not None:
+                    lidar_prior = lidar_prior.reshape(B * N, lidar_prior.size(-2), lidar_prior.size(-1))
                 img = img.reshape(B * N, C, H, W)
+            elif img.dim() == 4 and lidar_prior is not None:
+                lidar_prior = lidar_prior.reshape(img.size(0), lidar_prior.size(-2), lidar_prior.size(-1))
             if self.use_grid_mask:
                 img = self.grid_mask(img)
 
@@ -154,6 +167,7 @@ class Petr3D(MVXTwoStageDetector):
                 temp_ego_pose=mem_egopose,
                 prev_exists=mid_frame,
                 ego_pose_inv=ego_pose_inv,
+                lidar_token_prior=lidar_prior,
             )
             # for ToC3D
             if isinstance(backbone_out, ToC3DViTReturnType):
@@ -245,18 +259,20 @@ class Petr3D(MVXTwoStageDetector):
 
     @auto_fp16(apply_to=('img'), out_fp32=True)
     def extract_feat(
-        self, 
-        img, 
-        T, 
+        self,
+        img,
+        T,
         training_mode=False,
         gt_bboxes=None,
         centers2d=None,
         depths=None,
         prev_exists=None,
         ego_pose_inv=None,
+        lidar_token_prior=None,
     ):
         """Extract features from images and points."""
-        img_feats, token_masks, attn_scores, keep_idxes, drop_idxes = self.extract_img_feat(img, T, training_mode, gt_bboxes, centers2d, depths, prev_exists, ego_pose_inv)
+        img_feats, token_masks, attn_scores, keep_idxes, drop_idxes = self.extract_img_feat(
+            img, T, training_mode, gt_bboxes, centers2d, depths, prev_exists, ego_pose_inv, lidar_token_prior)
         return img_feats, token_masks, attn_scores, keep_idxes, drop_idxes
 
     def obtain_history_memory(self,
@@ -456,6 +472,13 @@ class Petr3D(MVXTwoStageDetector):
 
         prev_img = data['img'][:, :-self.num_frame_backbone_grads]
         rec_img = data['img'][:, -self.num_frame_backbone_grads:]
+        lidar_token_prior = data.get('lidar_token_prior', None)
+        if lidar_token_prior is not None:
+            prev_lidar_prior = lidar_token_prior[:, :-self.num_frame_backbone_grads]
+            rec_lidar_prior = lidar_token_prior[:, -self.num_frame_backbone_grads:]
+        else:
+            prev_lidar_prior = None
+            rec_lidar_prior = None
         # rec_img_feats = self.extract_feat(rec_img, self.num_frame_backbone_grads)[0]
         prev_gt_bboxes = gt_bboxes[:-self.num_frame_backbone_grads]
         prev_centers2d = centers2d[:-self.num_frame_backbone_grads]
@@ -471,7 +494,8 @@ class Petr3D(MVXTwoStageDetector):
             centers2d=rec_centers2d,
             depths=rec_depths,
             prev_exists=data['prev_exists'],
-            ego_pose_inv=data['ego_pose_inv']
+            ego_pose_inv=data['ego_pose_inv'],
+            lidar_token_prior=rec_lidar_prior
         )
         rec_img_feats = backbone_res[0]
         rec_token_masks = backbone_res[1]
@@ -487,7 +511,8 @@ class Petr3D(MVXTwoStageDetector):
                     centers2d=prev_centers2d,
                     depths=prev_depths,
                     prev_exists=data['prev_exists'],
-                    ego_pose_inv=data['ego_pose_inv']
+                    ego_pose_inv=data['ego_pose_inv'],
+                    lidar_token_prior=prev_lidar_prior
                 )[0]
             self.train()
             data['img_feats'] = torch.cat([prev_img_feats, rec_img_feats], dim=1)
@@ -555,7 +580,8 @@ class Petr3D(MVXTwoStageDetector):
             centers2d=centers2d,
             depths=depths,
             prev_exists=prev_exists,
-            ego_pose_inv=data['ego_pose_inv']
+            ego_pose_inv=data['ego_pose_inv'],
+            lidar_token_prior=data.get('lidar_token_prior')
         )
         data['img_feats'] = img_feats
 
