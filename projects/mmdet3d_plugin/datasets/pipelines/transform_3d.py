@@ -17,6 +17,14 @@ import torch
 from PIL import Image
 
 
+def _load_lidar_points(filename):
+    points = np.fromfile(filename, dtype=np.float32)
+    if points.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    points = points.reshape(-1, 5)[:, :3]
+    return points
+
+
 @PIPELINES.register_module()
 class PadMultiViewImage():
     """Pad the multi-view image.
@@ -383,3 +391,137 @@ class GlobalRotScaleTransImage():
         num_view = len(results["lidar2img"])
         for view in range(num_view):
             results["lidar2img"][view] = (torch.tensor(results["lidar2img"][view]).float() @ scale_mat_inv).numpy()
+
+@PIPELINES.register_module()
+class ComputeLidarTokenPrior:
+    """Compute LiDAR-guided priors for image tokens.
+
+    The pipeline projects LiDAR points into each camera view, rasterises
+    per-pixel depth and density statistics, and finally aggregates them to the
+    ViT patch grid. The resulting tensor follows the same ordering as the
+    image tokens (view-major, row-major) and is normalised to :math:`[0, 1]` per
+    camera.
+    """
+    def __init__(self,
+                 patch_size=16,
+                 depth_weight=1.0,
+                 density_weight=1.0,
+                 depth_epsilon=1e-3):
+        self.patch_size = patch_size
+        self.depth_weight = depth_weight
+        self.density_weight = density_weight
+        self.depth_epsilon = depth_epsilon
+
+    def __call__(self, results):
+        if 'img' not in results or 'lidar2img' not in results or 'pts_filename' not in results:
+            return results
+
+        points = _load_lidar_points(results['pts_filename'])
+        if points.shape[0] == 0:
+            priors = [self._empty_prior(img.shape[0], img.shape[1]) for img in results['img']]
+            results['lidar_token_prior'] = np.stack(priors).astype(np.float32)
+            return results
+
+        points_hom = np.concatenate([points, np.ones((points.shape[0], 1), dtype=np.float32)], axis=1)
+        priors = []
+        for view_idx, img in enumerate(results['img']):
+            lidar2img = results['lidar2img'][view_idx]
+            depth_map, density_map = self._project(points_hom, lidar2img, img.shape[0], img.shape[1])
+            priors.append(self._aggregate(depth_map, density_map))
+
+        results['lidar_token_prior'] = np.stack(priors).astype(np.float32)
+        return results
+
+    def _empty_prior(self, height, width):
+        if height % self.patch_size != 0 or width % self.patch_size != 0:
+            raise ValueError(
+                f'Image resolution ({height}, {width}) is not divisible by '
+                f'patch_size={self.patch_size}. Please pad or resize inputs '
+                'to align with the ViT patch embedding.'
+            )
+
+        h_tokens = height // self.patch_size
+        w_tokens = width // self.patch_size
+        return np.zeros((h_tokens, w_tokens), dtype=np.float32)
+
+    def _project(self, points_hom, lidar2img, height, width):
+        lidar2img = np.asarray(lidar2img)
+        proj = points_hom @ lidar2img.T
+        depth = proj[:, 2]
+        valid = depth > self.depth_epsilon
+        if not np.any(valid):
+            depth_map = np.zeros((height, width), dtype=np.float32)
+            density_map = np.zeros((height, width), dtype=np.float32)
+            return depth_map, density_map
+
+        proj = proj[valid]
+        depth = depth[valid]
+        u = proj[:, 0] / depth
+        v = proj[:, 1] / depth
+
+        u = np.round(u).astype(np.int32)
+        v = np.round(v).astype(np.int32)
+
+        valid = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+        if not np.any(valid):
+            depth_map = np.zeros((height, width), dtype=np.float32)
+            density_map = np.zeros((height, width), dtype=np.float32)
+            return depth_map, density_map
+
+        u = u[valid]
+        v = v[valid]
+        depth = depth[valid]
+        linear_idx = v * width + u
+
+        depth_map = np.full((height * width,), np.inf, dtype=np.float32)
+        density_map = np.zeros((height * width,), dtype=np.float32)
+
+        np.minimum.at(depth_map, linear_idx, depth)
+        np.add.at(density_map, linear_idx, 1)
+
+        depth_map = depth_map.reshape(height, width)
+        density_map = density_map.reshape(height, width)
+        depth_map[~np.isfinite(depth_map)] = 0.0
+        return depth_map, density_map
+
+    def _aggregate(self, depth_map, density_map):
+        height, width = depth_map.shape
+        h_tokens = height // self.patch_size
+        w_tokens = width // self.patch_size
+        priors = np.zeros((h_tokens, w_tokens), dtype=np.float32)
+        density_vals = np.zeros_like(priors)
+        inv_depth_vals = np.zeros_like(priors)
+
+        for h in range(h_tokens):
+            for w in range(w_tokens):
+                h_start = h * self.patch_size
+                h_end = h_start + self.patch_size
+                w_start = w * self.patch_size
+                w_end = w_start + self.patch_size
+
+                patch_depth = depth_map[h_start:h_end, w_start:w_end]
+                patch_density = density_map[h_start:h_end, w_start:w_end]
+
+                valid_depth = patch_depth[patch_depth > 0]
+                if valid_depth.size > 0:
+                    depth_med = np.median(valid_depth)
+                    inv_depth_vals[h, w] = 1.0 / max(depth_med, self.depth_epsilon)
+                else:
+                    inv_depth_vals[h, w] = 0.0
+
+                density_vals[h, w] = patch_density.sum() / (self.patch_size * self.patch_size)
+
+        density_min, density_max = density_vals.min(), density_vals.max()
+        if density_max > density_min:
+            density_norm = (density_vals - density_min) / (density_max - density_min)
+        else:
+            density_norm = np.zeros_like(density_vals)
+
+        raw_score = self.depth_weight * inv_depth_vals + self.density_weight * density_norm
+        raw_min, raw_max = raw_score.min(), raw_score.max()
+        if raw_max > raw_min:
+            priors = (raw_score - raw_min) / (raw_max - raw_min)
+        else:
+            priors = np.zeros_like(raw_score)
+
+        return priors.astype(np.float32)

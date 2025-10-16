@@ -397,6 +397,8 @@ class MotionAwareQueryGuidedTokenSelector(NaiveQueryGuidedTokenSelector):
         do_sample=True,
         override_ratio=None,
         prev_exists=None,
+        lidar_token_prior=None,
+        lidar_fusion_alpha=0.7,
         *args,
         **kwargs
     ):
@@ -412,6 +414,23 @@ class MotionAwareQueryGuidedTokenSelector(NaiveQueryGuidedTokenSelector):
             ego_pose_inv,
             prev_exists
         )
+        if lidar_token_prior is not None:
+            if lidar_token_prior.dim() == 3:
+                lidar_token_prior = lidar_token_prior.view(B, -1)
+            elif lidar_token_prior.dim() == 2:
+                lidar_token_prior = lidar_token_prior
+            else:
+                lidar_token_prior = lidar_token_prior.reshape(B, -1)
+
+            lidar_token_prior = lidar_token_prior.to(pred_score.dtype)
+            lidar_token_prior = lidar_token_prior.clamp(0.0, 1.0)
+            fused_prob = pred_score[:, :, 0].exp()
+            fused_prob = lidar_fusion_alpha * fused_prob + (1 - lidar_fusion_alpha) * lidar_token_prior
+            fused_prob = fused_prob.clamp(min=1e-6, max=1 - 1e-6)
+            pred_score = pred_score.clone()
+            pred_score[:, :, 0] = fused_prob.log()
+            pred_score[:, :, 1] = torch.log1p(-fused_prob)
+
         score = pred_score[:, :, 0]  # B x (H * W)
         if do_sample:
             keep_score, drop_score, keep_idx, drop_idx, new_mask = self.sample(pred_score, override_ratio)
