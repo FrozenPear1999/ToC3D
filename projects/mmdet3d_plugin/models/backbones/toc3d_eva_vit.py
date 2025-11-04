@@ -65,6 +65,7 @@ class ToC3DEVAViT(Backbone):
             use_represent_tokens = True,
             pc_range = None,
             token_selection_loss = None,
+            lidar_fusion=None,
     ):
         """
         Args:
@@ -154,6 +155,14 @@ class ToC3DEVAViT(Backbone):
             ) for i in range(len(pruning_loc))]
         )
 
+        self.lidar_prior_enabled = True
+        self.lidar_alpha = 0.7
+        self.lidar_bridge_reduce = 'max'
+        if lidar_fusion is not None:
+            self.lidar_prior_enabled = lidar_fusion.get('enabled', True)
+            self.lidar_alpha = lidar_fusion.get('alpha', 0.7)
+            self.lidar_bridge_reduce = lidar_fusion.get('bridge_reduce', 'max')
+
         # print some info
         if self.accelerate_global:
             print('*' * 20 + ' will prune tokens in global attention layer' + '*' * 20)
@@ -237,6 +246,7 @@ class ToC3DEVAViT(Backbone):
         temp_timestamp=None,
         temp_ego_pose=None,
         ego_pose_inv=None,
+        lidar_token_prior=None,
         *args, 
         **kwargs
     ):
@@ -247,6 +257,24 @@ class ToC3DEVAViT(Backbone):
             )
 
         B, H, W = x.shape[0], x.shape[1], x.shape[2]
+        if lidar_token_prior is not None and self.lidar_prior_enabled:
+            if not isinstance(lidar_token_prior, torch.Tensor):
+                lidar_token_prior = torch.as_tensor(lidar_token_prior, dtype=x.dtype, device=x.device)
+            else:
+                lidar_token_prior = lidar_token_prior.to(device=x.device, dtype=x.dtype)
+
+            if lidar_token_prior.dim() == 4 and lidar_token_prior.shape[-1] == 1:
+                lidar_token_prior = lidar_token_prior.squeeze(-1)
+            if lidar_token_prior.dim() == 2:
+                lidar_token_prior = lidar_token_prior.view(B, H, W)
+            if lidar_token_prior.dim() != 3:
+                raise ValueError('lidar_token_prior must have shape [B, H, W] or compatible dimensions')
+            if lidar_token_prior.shape[0] != B or lidar_token_prior.shape[1] != H or lidar_token_prior.shape[2] != W:
+                raise ValueError('lidar_token_prior shape mismatch with token grid')
+            lidar_prior = lidar_token_prior
+        else:
+            lidar_prior = None
+
         pruning_loc = 0
         masks = torch.ones([B, H, W, 1], device=x.device)
         decisions = []
@@ -275,6 +303,8 @@ class ToC3DEVAViT(Backbone):
                     override_ratio=None,
                     prev_exists=prev_exists,
                     ego_pose_inv=ego_pose_inv,
+                    lidar_token_prior=lidar_prior,
+                    lidar_fusion_alpha=self.lidar_alpha,
                 )[-5:]
 
                 pruning_loc += 1
@@ -283,6 +313,21 @@ class ToC3DEVAViT(Backbone):
                     attn_scores.append(attn_score)
                 keep_idxes.append(keep_idx)
                 drop_idxes.append(drop_idx)
+
+                if lidar_prior is not None:
+                    lidar_flat = lidar_prior.view(B, -1)
+                    new_flat = torch.zeros_like(lidar_flat)
+                    keep_vals = torch.gather(lidar_flat, 1, keep_idx)
+                    new_flat.scatter_(1, keep_idx, keep_vals)
+                    if drop_idx.numel() > 0:
+                        drop_vals = torch.gather(lidar_flat, 1, drop_idx)
+                        if self.lidar_bridge_reduce == 'mean':
+                            bridge_vals = drop_vals.mean(dim=1, keepdim=True)
+                        else:
+                            bridge_vals = drop_vals.max(dim=1, keepdim=True)[0]
+                        bridge_vals = bridge_vals.expand(-1, drop_idx.shape[1])
+                        new_flat.scatter_(1, drop_idx, bridge_vals)
+                    lidar_prior = new_flat.view_as(lidar_prior)
 
             x =  checkpoint(blk, x, scores, score_predictor, override_ratio=override_ratio, use_represent_tokens=self.use_represent_tokens) if self.use_checkpoint \
                 else blk(x, scores, score_predictor, override_ratio=override_ratio, use_represent_tokens=self.use_represent_tokens)

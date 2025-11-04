@@ -3,6 +3,7 @@ from .transform_3d import(
     NormalizeMultiviewImage,
     ResizeCropFlipRotImage,
     GlobalRotScaleTransImage,
+    ComputeLidarTokenPrior,
 )
 
 from .formating import(

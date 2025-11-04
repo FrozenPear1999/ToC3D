@@ -10,11 +10,23 @@
 #  Modified by Shihao Wang
 # ------------------------------------------------------------------------
 
+import csv
+import json
+import os
+
 import numpy as np
 import mmcv
 from mmdet.datasets.builder import PIPELINES
 import torch
 from PIL import Image
+
+
+def _load_lidar_points(filename):
+    points = np.fromfile(filename, dtype=np.float32)
+    if points.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    points = points.reshape(-1, 5)[:, :3]
+    return points
 
 
 @PIPELINES.register_module()
@@ -383,3 +395,503 @@ class GlobalRotScaleTransImage():
         num_view = len(results["lidar2img"])
         for view in range(num_view):
             results["lidar2img"][view] = (torch.tensor(results["lidar2img"][view]).float() @ scale_mat_inv).numpy()
+
+class CoverageAccumulator:
+    """Running statistics for LiDAR token coverage."""
+
+    def __init__(self, view_count, num_bins):
+        self.view_count = view_count
+        self.num_bins = num_bins
+        self.sample_count = 0
+        self.view_sum = np.zeros(view_count, dtype=np.float64)
+        self.view_sq_sum = np.zeros(view_count, dtype=np.float64)
+        self.total_sum = 0.0
+        self.total_sq_sum = 0.0
+        self.view_hist_sum = np.zeros((view_count, num_bins), dtype=np.float64)
+        self.total_hist_sum = np.zeros(num_bins, dtype=np.float64)
+        self.view_token_sum = np.zeros(view_count, dtype=np.float64)
+        self.total_token_sum = 0.0
+
+    def update(self, coverages, total_coverage, view_hist_counts,
+               total_hist_counts, view_token_counts, total_tokens):
+        coverages = np.asarray(coverages, dtype=np.float64)
+        view_hist_counts = np.asarray(view_hist_counts, dtype=np.float64)
+        self.sample_count += 1
+        self.view_sum += coverages
+        self.view_sq_sum += np.square(coverages)
+        self.total_sum += float(total_coverage)
+        self.total_sq_sum += float(total_coverage) ** 2
+        self.view_hist_sum += view_hist_counts
+        self.total_hist_sum += np.asarray(total_hist_counts, dtype=np.float64)
+        self.view_token_sum += np.asarray(view_token_counts, dtype=np.float64)
+        self.total_token_sum += float(total_tokens)
+
+    def _mean_std(self, sum_vals, sq_sum_vals):
+        if self.sample_count == 0:
+            zeros = np.zeros_like(sum_vals)
+            return zeros, zeros
+        mean = sum_vals / self.sample_count
+        var = np.maximum(sq_sum_vals / self.sample_count - np.square(mean), 0.0)
+        return mean, np.sqrt(var)
+
+    def summarise(self, bin_labels):
+        mean_view, std_view = self._mean_std(self.view_sum, self.view_sq_sum)
+        total_mean, total_std = self._mean_std(
+            np.asarray([self.total_sum], dtype=np.float64),
+            np.asarray([self.total_sq_sum], dtype=np.float64)
+        )
+
+        view_hist = []
+        for idx in range(self.view_count):
+            tokens = self.view_token_sum[idx]
+            if tokens > 0:
+                view_hist.append((self.view_hist_sum[idx] / tokens).tolist())
+            else:
+                view_hist.append([0.0] * self.num_bins)
+
+        if self.total_token_sum > 0:
+            total_hist = (self.total_hist_sum / self.total_token_sum).tolist()
+        else:
+            total_hist = [0.0] * self.num_bins
+
+        return {
+            'num_samples': int(self.sample_count),
+            'coverage_per_view_mean': mean_view.tolist(),
+            'coverage_per_view_std': std_view.tolist(),
+            'coverage_total_mean': float(total_mean[0]),
+            'coverage_total_std': float(total_std[0]),
+            'histogram_bins': bin_labels,
+            'histogram_per_view': view_hist,
+            'histogram_total': total_hist,
+            'tokens_per_view': self.view_token_sum.tolist(),
+            'tokens_total': float(self.total_token_sum)
+        }
+
+
+class LidarCoverageMonitor:
+    """Collect LiDAR token coverage metrics without affecting the pipeline."""
+
+    BIN_LABELS = ['0', '1', '2-3', '4-7', '8-15', '16+']
+
+    def __init__(self, config, patch_size):
+        config = config or {}
+        self.enabled = bool(config.get('enable', False))
+        if not self.enabled:
+            self.view_names = None
+            return
+
+        self.patch_size = patch_size
+        self.log_every = int(config.get('log_every', 50))
+        self.save_mask_debug = bool(config.get('save_mask_debug', False))
+        self.debug_max_samples = int(config.get('debug_max_samples', 5))
+        self.output_dir = config.get('output_dir', 'work_dirs/lidar_coverage')
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.masks_dir = os.path.join(self.output_dir, 'masks')
+        if self.save_mask_debug:
+            os.makedirs(self.masks_dir, exist_ok=True)
+
+        self.csv_path = os.path.join(self.output_dir, 'coverage.csv')
+        self.csv_file = None
+        self.csv_writer = None
+
+        self.view_names = None
+        self.global_accumulator = None
+        self.resolution_accumulators = {}
+        self.sample_counter = 0
+        self.debug_saved = 0
+
+    def _ensure_writer(self, view_count):
+        if self.csv_writer is not None:
+            return
+        fieldnames = ['scene_token', 'sample_token', 'height', 'width', 'patch']
+        fieldnames += [f'cov_v{i}' for i in range(view_count)]
+        fieldnames.append('cov_total')
+        fieldnames += [f'hit_v{i}' for i in range(view_count)]
+        fieldnames += [f'total_v{i}' for i in range(view_count)]
+        fieldnames.append('hit_total')
+        fieldnames.append('total_total')
+        file_exists = os.path.exists(self.csv_path)
+        self.csv_file = open(self.csv_path, 'a', newline='')
+        self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=fieldnames)
+        if not file_exists or os.path.getsize(self.csv_path) == 0:
+            self.csv_writer.writeheader()
+
+    def _compute_histogram(self, patch_counts):
+        counts = np.asarray(patch_counts, dtype=np.float64)
+        hist = np.zeros(len(self.BIN_LABELS), dtype=np.float64)
+        hist[0] = np.sum(counts == 0)
+        hist[1] = np.sum(counts == 1)
+        hist[2] = np.sum((counts >= 2) & (counts <= 3))
+        hist[3] = np.sum((counts >= 4) & (counts <= 7))
+        hist[4] = np.sum((counts >= 8) & (counts <= 15))
+        hist[5] = np.sum(counts >= 16)
+        return hist
+
+    def _ensure_accumulators(self, view_count):
+        if self.global_accumulator is None:
+            self.global_accumulator = CoverageAccumulator(
+                view_count, len(self.BIN_LABELS))
+
+    def _resolution_accumulator(self, view_count, height, width):
+        key = (int(height), int(width), int(self.patch_size))
+        if key not in self.resolution_accumulators:
+            self.resolution_accumulators[key] = CoverageAccumulator(
+                view_count, len(self.BIN_LABELS))
+        return key, self.resolution_accumulators[key]
+
+    def _maybe_save_masks(self, meta, view_stats, view_names):
+        if not self.save_mask_debug or self.debug_saved >= self.debug_max_samples:
+            return
+        sample_token = meta.get('sample_token', f'sample_{self.sample_counter}')
+        for idx, stats in enumerate(view_stats):
+            filename = f"{sample_token}_view{view_names[idx]}.npz"
+            np.savez_compressed(
+                os.path.join(self.masks_dir, filename),
+                hit_mask=stats['hit_mask'].astype(np.uint8),
+                valid_mask=stats['valid_mask'].astype(np.uint8),
+                patch_counts=stats['patch_counts'].astype(np.float32)
+            )
+        self.debug_saved += 1
+
+    def record_sample(self, meta, view_stats, patch_size, height, width, view_names):
+        if not self.enabled:
+            return
+
+        view_count = len(view_stats)
+        self._ensure_writer(view_count)
+        self._ensure_accumulators(view_count)
+        _, res_acc = self._resolution_accumulator(view_count, height, width)
+        if self.view_names is None:
+            self.view_names = list(view_names)
+
+        coverages = np.zeros(view_count, dtype=np.float64)
+        hits = np.zeros(view_count, dtype=np.float64)
+        totals = np.zeros(view_count, dtype=np.float64)
+        view_hists = np.zeros((view_count, len(self.BIN_LABELS)), dtype=np.float64)
+        total_hist = np.zeros(len(self.BIN_LABELS), dtype=np.float64)
+
+        for idx, stats in enumerate(view_stats):
+            valid_mask = stats['valid_mask']
+            patch_counts = stats['patch_counts']
+            hit_mask = stats['hit_mask'] & valid_mask
+            valid_tokens = float(valid_mask.sum())
+            hit_tokens = float(hit_mask.sum())
+            coverages[idx] = hit_tokens / valid_tokens if valid_tokens > 0 else 0.0
+            hits[idx] = hit_tokens
+            totals[idx] = valid_tokens
+            hist = self._compute_histogram(patch_counts[valid_mask])
+            view_hists[idx] = hist
+            total_hist += hist
+
+        total_tokens = float(totals.sum())
+        total_hits = float(hits.sum())
+        total_coverage = total_hits / total_tokens if total_tokens > 0 else 0.0
+
+        self.global_accumulator.update(coverages, total_coverage, view_hists,
+                                       total_hist, totals, total_tokens)
+        res_acc.update(coverages, total_coverage, view_hists,
+                       total_hist, totals, total_tokens)
+
+        row = {
+            'scene_token': meta.get('scene_token'),
+            'sample_token': meta.get('sample_token'),
+            'height': int(height),
+            'width': int(width),
+            'patch': int(patch_size),
+            'cov_total': total_coverage,
+            'hit_total': int(total_hits),
+            'total_total': int(total_tokens)
+        }
+        for idx in range(view_count):
+            row[f'cov_v{idx}'] = coverages[idx]
+            row[f'hit_v{idx}'] = int(hits[idx])
+            row[f'total_v{idx}'] = int(totals[idx])
+        self.csv_writer.writerow(row)
+        self.csv_file.flush()
+
+        self.sample_counter += 1
+        if self.log_every > 0 and self.sample_counter % self.log_every == 0:
+            coverage_str = ', '.join(f'{cov:.3f}' for cov in coverages.tolist())
+            print(
+                f"LidarCoverage | view={self.view_names}: [{coverage_str}] "
+                f"total={total_coverage:.3f} | res={int(height)}x{int(width)} p={patch_size}"
+            )
+
+        self._maybe_save_masks(meta, view_stats, view_names)
+
+    def finalize(self):
+        if not self.enabled:
+            return
+        if self.csv_file is not None:
+            self.csv_file.close()
+            self.csv_file = None
+            self.csv_writer = None
+
+        if self.global_accumulator is None:
+            return
+
+        summary = {
+            'view_names': self.view_names,
+            'bin_labels': self.BIN_LABELS,
+            'overall': self.global_accumulator.summarise(self.BIN_LABELS),
+            'per_resolution': {}
+        }
+        for (height, width, patch), acc in self.resolution_accumulators.items():
+            key = f'{height}x{width}_p{patch}'
+            summary['per_resolution'][key] = acc.summarise(self.BIN_LABELS)
+
+        with open(os.path.join(self.output_dir, 'summary.json'), 'w') as f:
+            json.dump(summary, f, indent=2)
+
+
+@PIPELINES.register_module()
+class ComputeLidarTokenPrior:
+    """Compute LiDAR-guided priors for image tokens.
+
+    The pipeline projects LiDAR points into each camera view, rasterises
+    per-pixel depth and density statistics, and finally aggregates them to the
+    ViT patch grid. The resulting tensor follows the same ordering as the
+    image tokens (view-major, row-major) and is normalised to :math:`[0, 1]` per
+    camera.
+    """
+    def __init__(self,
+                 patch_size=16,
+                 depth_weight=1.0,
+                 density_weight=1.0,
+                 depth_epsilon=1e-3,
+                 coverage=None):
+        self.patch_size = patch_size
+        self.depth_weight = depth_weight
+        self.density_weight = density_weight
+        self.depth_epsilon = depth_epsilon
+        self.coverage_monitor = LidarCoverageMonitor(coverage, patch_size)
+
+    def __call__(self, results):
+        if 'img' not in results or 'lidar2img' not in results or 'pts_filename' not in results:
+            return results
+
+        points = _load_lidar_points(results['pts_filename'])
+        if points.shape[0] > 0:
+            points_hom = np.concatenate([points, np.ones((points.shape[0], 1), dtype=np.float32)], axis=1)
+        else:
+            points_hom = None
+
+        monitor_enabled = hasattr(self, 'coverage_monitor') and self.coverage_monitor.enabled
+        orig_shapes = results.get('img_shape') if monitor_enabled else None
+        view_names = self._infer_view_names(results.get('img_filename'), len(results['img']))
+        sample_meta = {
+            'scene_token': results.get('scene_token'),
+            'sample_token': results.get('sample_idx') or results.get('token')
+        }
+
+        priors = []
+        view_stats = []
+        view_heights = []
+        view_widths = []
+        for view_idx, img in enumerate(results['img']):
+            height, width = img.shape[0], img.shape[1]
+            lidar2img = results['lidar2img'][view_idx]
+            view_heights.append(height)
+            view_widths.append(width)
+
+            if points_hom is None:
+                depth_map = np.zeros((height, width), dtype=np.float32)
+                density_map = np.zeros((height, width), dtype=np.float32)
+            else:
+                depth_map, density_map = self._project(points_hom, lidar2img, height, width)
+
+            valid_shape = None
+            if orig_shapes is not None and view_idx < len(orig_shapes):
+                orig_shape = orig_shapes[view_idx]
+                if isinstance(orig_shape, (list, tuple)) and len(orig_shape) >= 2:
+                    valid_shape = (int(orig_shape[0]), int(orig_shape[1]))
+                elif hasattr(orig_shape, '__len__') and len(orig_shape) >= 2:
+                    valid_shape = (int(orig_shape[0]), int(orig_shape[1]))
+
+            prior, stats = self._aggregate(
+                depth_map,
+                density_map,
+                valid_shape=valid_shape,
+                collect_stats=monitor_enabled
+            )
+            priors.append(prior)
+            if monitor_enabled and stats is not None:
+                view_stats.append(stats)
+
+        results['lidar_token_prior'] = np.stack(priors).astype(np.float32)
+
+        if monitor_enabled and view_stats:
+            height0 = view_heights[0] if view_heights else 0
+            width0 = view_widths[0] if view_widths else 0
+            self.coverage_monitor.record_sample(
+                sample_meta,
+                view_stats,
+                self.patch_size,
+                height0,
+                width0,
+                view_names
+            )
+
+        return results
+
+    def _empty_prior(self, height, width):
+        if height % self.patch_size != 0 or width % self.patch_size != 0:
+            raise ValueError(
+                f'Image resolution ({height}, {width}) is not divisible by '
+                f'patch_size={self.patch_size}. Please pad or resize inputs '
+                'to align with the ViT patch embedding.'
+            )
+
+        h_tokens = height // self.patch_size
+        w_tokens = width // self.patch_size
+        return np.zeros((h_tokens, w_tokens), dtype=np.float32)
+
+    def _project(self, points_hom, lidar2img, height, width):
+        lidar2img = np.asarray(lidar2img)
+        proj = points_hom @ lidar2img.T
+        depth = proj[:, 2]
+        valid = depth > self.depth_epsilon
+        if not np.any(valid):
+            depth_map = np.zeros((height, width), dtype=np.float32)
+            density_map = np.zeros((height, width), dtype=np.float32)
+            return depth_map, density_map
+
+        proj = proj[valid]
+        depth = depth[valid]
+        u = proj[:, 0] / depth
+        v = proj[:, 1] / depth
+
+        u = np.round(u).astype(np.int32)
+        v = np.round(v).astype(np.int32)
+
+        valid = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+        if not np.any(valid):
+            depth_map = np.zeros((height, width), dtype=np.float32)
+            density_map = np.zeros((height, width), dtype=np.float32)
+            return depth_map, density_map
+
+        u = u[valid]
+        v = v[valid]
+        depth = depth[valid]
+        linear_idx = v * width + u
+
+        depth_map = np.full((height * width,), np.inf, dtype=np.float32)
+        density_map = np.zeros((height * width,), dtype=np.float32)
+
+        np.minimum.at(depth_map, linear_idx, depth)
+        np.add.at(density_map, linear_idx, 1)
+
+        depth_map = depth_map.reshape(height, width)
+        density_map = density_map.reshape(height, width)
+        depth_map[~np.isfinite(depth_map)] = 0.0
+        return depth_map, density_map
+
+    def _aggregate(self, depth_map, density_map, valid_shape=None, collect_stats=False):
+        height, width = depth_map.shape
+        if height % self.patch_size != 0 or width % self.patch_size != 0:
+            raise ValueError(
+                f'Image resolution ({height}, {width}) is not divisible by '
+                f'patch_size={self.patch_size}. Please pad inputs accordingly.'
+            )
+
+        h_tokens = height // self.patch_size
+        w_tokens = width // self.patch_size
+        priors = np.zeros((h_tokens, w_tokens), dtype=np.float32)
+        density_vals = np.zeros_like(priors)
+        inv_depth_vals = np.zeros_like(priors)
+        patch_counts = np.zeros((h_tokens, w_tokens), dtype=np.float32)
+
+        for h in range(h_tokens):
+            h_start = h * self.patch_size
+            h_end = h_start + self.patch_size
+            for w in range(w_tokens):
+                w_start = w * self.patch_size
+                w_end = w_start + self.patch_size
+
+                patch_depth = depth_map[h_start:h_end, w_start:w_end]
+                patch_density = density_map[h_start:h_end, w_start:w_end]
+
+                valid_depth = patch_depth[patch_depth > 0]
+                if valid_depth.size > 0:
+                    depth_med = np.median(valid_depth)
+                    inv_depth_vals[h, w] = 1.0 / max(depth_med, self.depth_epsilon)
+                else:
+                    inv_depth_vals[h, w] = 0.0
+
+                count = patch_density.sum()
+                patch_counts[h, w] = count
+                density_vals[h, w] = count / (self.patch_size * self.patch_size)
+
+        density_min, density_max = density_vals.min(), density_vals.max()
+        if density_max > density_min:
+            density_norm = (density_vals - density_min) / (density_max - density_min)
+        else:
+            density_norm = np.zeros_like(density_vals)
+
+        raw_score = self.depth_weight * inv_depth_vals + self.density_weight * density_norm
+        raw_min, raw_max = raw_score.min(), raw_score.max()
+        if raw_max > raw_min:
+            priors = (raw_score - raw_min) / (raw_max - raw_min)
+        else:
+            priors = np.zeros_like(raw_score)
+
+        stats = None
+        if collect_stats:
+            valid_mask = self._valid_patch_mask(h_tokens, w_tokens, valid_shape)
+            stats = {
+                'hit_mask': patch_counts > 0,
+                'patch_counts': patch_counts,
+                'valid_mask': valid_mask
+            }
+
+        return priors.astype(np.float32), stats
+
+    def _valid_patch_mask(self, h_tokens, w_tokens, valid_shape):
+        if valid_shape is None:
+            return np.ones((h_tokens, w_tokens), dtype=bool)
+
+        valid_h, valid_w = valid_shape
+        mask = np.zeros((h_tokens, w_tokens), dtype=bool)
+        for h in range(h_tokens):
+            h_start = h * self.patch_size
+            if h_start >= valid_h:
+                break
+            for w in range(w_tokens):
+                w_start = w * self.patch_size
+                if w_start >= valid_w:
+                    break
+                mask[h, w] = True
+        return mask
+
+    def _infer_view_names(self, filenames, count):
+        if not isinstance(filenames, (list, tuple)) or len(filenames) != count:
+            return [f'v{idx}' for idx in range(count)]
+
+        names = []
+        for idx, path in enumerate(filenames):
+            name = f'v{idx}'
+            if isinstance(path, str):
+                norm = os.path.normpath(path)
+                parts = norm.split(os.sep)
+                candidate = None
+                for part in reversed(parts):
+                    upper = part.upper()
+                    if upper.startswith('CAM_'):
+                        candidate = part
+                        break
+                if candidate is None and parts:
+                    candidate = os.path.splitext(parts[-1])[0]
+                if candidate:
+                    name = candidate
+            names.append(name)
+        return names
+
+    def close(self):
+        if hasattr(self, 'coverage_monitor') and self.coverage_monitor.enabled:
+            self.coverage_monitor.finalize()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

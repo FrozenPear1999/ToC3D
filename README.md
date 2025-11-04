@@ -79,6 +79,23 @@ ckpts/
 └── eva02_L_coco_det_sys_o365_remapped.pth
 ```
 
+### Adjusting LiDAR fusion weights
+The LiDAR prior and MQTS importance scores are blended with coefficient `alpha` inside the EVA backbone. By default this value is defined in [`projects/mmdet3d_plugin/models/backbones/toc3d_eva_vit.py`](projects/mmdet3d_plugin/models/backbones/toc3d_eva_vit.py) where `self.lidar_alpha` is set to `0.7`. You can override it from any experiment configuration via the `lidar_fusion` dictionary, for example:
+
+```python
+model = dict(
+    type='Petr3D',
+    # ...
+    img_backbone=dict(
+        type='ToC3DEVAViT',
+        # ...
+        lidar_fusion=dict(alpha=0.5),  # MQTS 50%, LiDAR 50%
+    ),
+)
+```
+
+No further code changes are required—the updated `alpha` value will be propagated automatically during inference.
+
 
 ## 💾 Training logs and official weights
 **Note: the performance of trained models will be influenced by the environments and machines. So we provide our training logs and weights here.**
