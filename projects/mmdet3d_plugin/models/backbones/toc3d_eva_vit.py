@@ -17,8 +17,12 @@ from .eva_utils import (
     VisionRotaryEmbeddingFast,
     VisionRotaryEmbeddingFastWithSelection
 )
-from projects.mmdet3d_plugin.models.backbones.toc3d_utils import MotionAwareQueryGuidedTokenSelector, ToC3DViTReturnType
-from projects.mmdet3d_plugin.models.backbones.toc3d_utils import merge_tokens, batch_index_fill, batch_index_select 
+from projects.mmdet3d_plugin.models.backbones.toc3d_utils import (
+    LiDAROnlyTokenSelector,
+    ToC3DViTReturnType,
+    TokenSelectorBase,
+)
+from projects.mmdet3d_plugin.models.backbones.toc3d_utils import merge_tokens, batch_index_fill, batch_index_select
 from projects.mmdet3d_plugin.models.utils.gpu_timer import GLOBAL_TIMER
 
 
@@ -144,14 +148,9 @@ class ToC3DEVAViT(Backbone):
         self.pruning_num_queries = pruning_num_queries
         self.pruning_attn_scale = pruning_attn_scale
         self.score_predictor = nn.ModuleList(
-            [MotionAwareQueryGuidedTokenSelector(
-                embed_dim=embed_dim,
-                num_queries=pruning_num_queries,
+            [LiDAROnlyTokenSelector(
                 ratio=token_ratio[i],
-                attn_scale=self.pruning_attn_scale,
                 use_mask=score_mask,
-                pc_range=pc_range,
-                score_type=pruning_score_type
             ) for i in range(len(pruning_loc))]
         )
 
@@ -441,7 +440,7 @@ class ToC3DEVAViTBlock(Block):
         self,
         x: torch.Tensor,
         scores: torch.Tensor = None,
-        score_predictor: MotionAwareQueryGuidedTokenSelector = None,
+        score_predictor: TokenSelectorBase = None,
         override_ratio = None,
         use_represent_tokens = True,
         *args, 

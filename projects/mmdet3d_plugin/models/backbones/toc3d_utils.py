@@ -441,6 +441,115 @@ class MotionAwareQueryGuidedTokenSelector(NaiveQueryGuidedTokenSelector):
             return score.view(B, H, W)
 
 
+class LiDAROnlyTokenSelector(TokenSelectorBase):
+    """Token selector that relies purely on pre-computed LiDAR priors."""
+
+    def __init__(
+        self,
+        *,
+        ratio=0.5,
+        hard_score=False,
+        use_mask=True,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        self.ratio = ratio
+        self.hard_score = hard_score
+        self.use_mask = use_mask
+
+    def _prepare_prior(self, lidar_token_prior, input_x, mask):
+        B, H, W, _ = input_x.shape
+        if lidar_token_prior is None:
+            raise ValueError('lidar_token_prior must be provided for LiDAROnlyTokenSelector')
+
+        if not torch.is_tensor(lidar_token_prior):
+            lidar_token_prior = torch.as_tensor(
+                lidar_token_prior, dtype=input_x.dtype, device=input_x.device
+            )
+        else:
+            lidar_token_prior = lidar_token_prior.to(device=input_x.device, dtype=input_x.dtype)
+
+        if lidar_token_prior.dim() == 4 and lidar_token_prior.shape[-1] == 1:
+            lidar_token_prior = lidar_token_prior.squeeze(-1)
+        if lidar_token_prior.dim() == 2:
+            lidar_token_prior = lidar_token_prior.view(B, H, W)
+
+        if lidar_token_prior.dim() != 3:
+            raise ValueError('lidar_token_prior must have shape [B, H, W] or broadcastable equivalent')
+
+        if lidar_token_prior.shape[0] != B or lidar_token_prior.shape[1] != H or lidar_token_prior.shape[2] != W:
+            raise ValueError('lidar_token_prior shape mismatch with token grid')
+
+        if self.use_mask and mask is not None:
+            mask_tensor = mask
+            if mask_tensor.dim() == 4 and mask_tensor.shape[-1] == 1:
+                mask_tensor = mask_tensor.squeeze(-1)
+            mask_tensor = mask_tensor.to(dtype=lidar_token_prior.dtype, device=lidar_token_prior.device)
+            lidar_token_prior = lidar_token_prior * mask_tensor
+
+        lidar_token_prior = lidar_token_prior.clamp(0.0, 1.0)
+        return lidar_token_prior
+
+    def score(self, input_x, mask, *, lidar_token_prior=None, **kwargs):
+        B, H, W, _ = input_x.shape
+        lidar_token_prior = self._prepare_prior(lidar_token_prior, input_x, mask)
+
+        prior_flat = lidar_token_prior.view(B, -1)
+        eps = 1e-6
+        prob = prior_flat.clamp(min=eps, max=1 - eps)
+        log_keep = prob.log()
+        log_drop = torch.log1p(-prob)
+        pred_score = torch.stack([log_keep, log_drop], dim=-1)
+        return pred_score
+
+    def sample(self, pred_score: torch.Tensor, override_ratio=None):
+        ratio = override_ratio if override_ratio is not None else self.ratio
+        if len(pred_score.shape) == 4:
+            pred_score = pred_score.flatten(1, 2)
+        score = pred_score[:, :, 0]
+        B, N = score.shape[:2]
+        num_keep_node = int(N * ratio)
+        sorted_score, sorted_idx = torch.sort(score, dim=1, descending=True)
+        keep_score = sorted_score[:, :num_keep_node]
+        keep_idx = sorted_idx[:, :num_keep_node]
+        drop_score = sorted_score[:, num_keep_node:]
+        drop_idx = sorted_idx[:, num_keep_node:]
+
+        if self.training or (not self.hard_score):
+            new_mask = F.gumbel_softmax(pred_score, hard=False, dim=-1)[:, :, 0:1]
+        else:
+            new_mask = torch.zeros([B, N, 1], device=pred_score.device)
+            new_mask = batch_index_fill(
+                new_mask,
+                torch.ones([B, num_keep_node, 1], device=pred_score.device),
+                torch.zeros([B, N - num_keep_node, 1], device=pred_score.device),
+                keep_idx,
+                drop_idx
+            )
+
+        return keep_score, drop_score, keep_idx, drop_idx, new_mask
+
+    def forward(
+        self,
+        input_x,
+        mask,
+        do_sample=True,
+        override_ratio=None,
+        *,
+        lidar_token_prior=None,
+        **kwargs,
+    ):
+        B, H, W, _ = input_x.shape
+        pred_score = self.score(input_x, mask, lidar_token_prior=lidar_token_prior)
+        score = pred_score[:, :, 0]
+        if do_sample:
+            keep_score, drop_score, keep_idx, drop_idx, new_mask = self.sample(pred_score, override_ratio)
+            new_mask = new_mask.view(B, H, W, 1)
+            return keep_score, drop_score, keep_idx, drop_idx, new_mask, score.view(B, H, W), None
+        else:
+            return score.view(B, H, W)
+
+
 class MLPBlock(nn.Module):
     def __init__(
         self,
